@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# source PDFs and full-run outputs -- not committed, see README
+*.pdf
+ocr_cache/
+prakaran_out/
+prakaran/
+probe_out/
