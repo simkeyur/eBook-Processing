@@ -77,6 +77,14 @@ def main():
         for p, result in zip(batch_pages, results):
             out = result.model_dump()
             out["source_page"] = p
+            if not out.get("blocks"):
+                # A dead/unresponsive llama-server (e.g. connection errors mid-run)
+                # can make the driver return an empty result instead of raising.
+                # Don't cache that as if the page succeeded -- leave it uncached
+                # so a re-invocation retries it instead of silently skipping it.
+                print(f"WARNING: page {p} returned no blocks -- not caching, "
+                      f"will retry on next invocation", flush=True)
+                continue
             with open(cache_dir / f"page_{p:04d}.json", "w", encoding="utf-8") as f:
                 json.dump(out, f, ensure_ascii=False)
 
