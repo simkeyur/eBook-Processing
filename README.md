@@ -130,12 +130,14 @@ cd ..
 # 3. Python env for this project
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-# NOTE: surya-ocr pulls in torch as a transitive dependency, but this
-# pipeline's actual OCR inference runs through the separate llama-server
-# process (CUDA via llama.cpp), not through torch tensor ops -- the plain
-# CPU pip wheel for torch is fine here. Don't spend time chasing NVIDIA's
-# special Jetson PyTorch wheel unless some other part of your workflow
-# needs it.
+# NOTE: surya-ocr pulls in torch (+torchvision) as a transitive dependency, but
+# this pipeline's actual OCR inference runs through the separate llama-server
+# process (CUDA via llama.cpp), not through torch tensor ops -- so a CPU-only
+# torch wheel is all that's needed. Be aware the DEFAULT PyPI linux torch wheel
+# bundles ~1GB of NVIDIA CUDA libraries; requirements.txt pins the +cpu wheels
+# from download.pytorch.org/whl/cpu to avoid that (see "Linux / x86_64 CPU"
+# below). On a real Jetson you also do NOT need NVIDIA's special JetPack
+# PyTorch wheel -- the CPU wheel is fine since torch isn't in the hot path.
 
 # 4. Sanity-check the PDF before doing anything expensive
 python scripts/probe_pdf.py your_book.pdf --pages 1,50,100 --dpi 200 --out-dir probe_out
@@ -161,6 +163,42 @@ python scripts/parse_prakaran.py ocr_cache/ prakaran_out/
 report the extrapolated full-book ETA back to the user, and get
 confirmation before starting step 6 unattended for hours — see the
 "Gotchas" section above on why a fast smoke test can be misleading.
+
+### Linux / x86_64 CPU (AMD or Intel, no NVIDIA GPU)
+
+For an ordinary x86_64 Linux box with no NVIDIA GPU — including AMD APU
+machines (e.g. Ryzen + integrated Radeon Vega) — build `llama-server`
+**CPU-only**. Do **not** use `GGML_CUDA=ON` (no CUDA) and don't bother with
+the AMD iGPU via ROCm/HIP either: an integrated GPU shares the CPU's memory
+bus, and this workload is memory-bandwidth-bound (see "Hardware notes"
+above), so the iGPU offers no speedup over the CPU while ROCm on unsupported
+`gfx90c`-class APUs is fragile. The multi-core CPU build is the reliable,
+equal-or-faster choice here.
+
+```bash
+# 1. System deps. If you don't have root, cmake is also available as a pip
+#    wheel (`pip install cmake`) -- everything else (gcc/g++/make/git) is
+#    usually already present on a dev box.
+sudo apt update && sudo apt install -y build-essential cmake git python3-venv python3-pip
+
+# 2. Build llama.cpp CPU-only (note GGML_CUDA=OFF, and CURL off to avoid an
+#    extra system dep). cmake auto-detects -march=native + OpenMP.
+git clone --depth 1 https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+cmake -B build -DGGML_CUDA=OFF -DLLAMA_CURL=OFF
+cmake --build build --config Release -j"$(nproc)" --target llama-server
+export LLAMA_CPP_BINARY="$(pwd)/build/bin/llama-server"
+cd ..
+
+# 3. Python env (same as the Jetson runbook). requirements.txt already pins
+#    the CPU-only torch/torchvision wheels on Linux, so this pulls no CUDA
+#    libraries.
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# 4-7. Probe / benchmark / full run / parse -- identical to the Jetson runbook
+#      steps above. Benchmark on real body-text pages, not front matter.
+```
 
 ## Usage reference
 

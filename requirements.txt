@@ -1,3 +1,18 @@
+# Install CPU-only torch/torchvision from PyTorch's CPU index.
+# surya-ocr pulls torch>=2.7 + torchvision>=0.20 transitively, but the DEFAULT
+# PyPI linux wheels bundle ~1GB of NVIDIA CUDA libraries (nvidia-cudnn-cu13,
+# nvidia-cusparselt-cu13, cuda-toolkit, ...) that are dead weight on a CPU-only
+# or non-NVIDIA box. The +cpu wheels below carry none of that. See README
+# "Linux / x86_64 CPU" setup section.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 pymupdf==1.28.0
 pillow==10.4.0
+
+# Pin +cpu wheels on Linux only. macOS PyPI wheels are already CPU/MPS (no CUDA
+# bundling), and no +cpu variant is published for darwin, so let surya resolve
+# torch itself there.
+torch==2.13.0+cpu ; sys_platform == "linux"
+torchvision==0.28.0+cpu ; sys_platform == "linux"
+
 surya-ocr==0.22.1
