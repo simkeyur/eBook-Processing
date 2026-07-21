@@ -18,7 +18,15 @@ import re
 from pathlib import Path
 from html.parser import HTMLParser
 
-GUJ_DIGITS = str.maketrans("૦૧૨૩૪૫૬૭૮૯", "0123456789")
+# Accept Gujarati AND Devanagari digits -- surya-ocr occasionally hallucinates
+# Devanagari script (including digits) on pages with stylized/decorative
+# typography even though the source is printed Gujarati. Without this, a
+# misread marker like "१" (Devanagari) instead of "૧" (Gujarati) fails to
+# parse as a number and silently corrupts downstream output -- see the
+# verse_buffer anomaly handling below.
+DIGIT_CHARS = "૦૧૨૩૪૫૬૭૮૯०१२३४५६७८९"
+DIGIT_TRANSLATE = str.maketrans(DIGIT_CHARS, "0123456789" * 2)
+NON_DIGIT_RE = re.compile(r"[^૦-૯०-९0-9]")
 
 NOISE_EXACT = {
     "INDEX",
@@ -26,10 +34,12 @@ NOISE_EXACT = {
     "શ્રી મુક્તમુનિ યુરિત્ર ચિંતામણિ",  # OCR variant seen on some pages
 }
 NOISE_PATTERNS = [
-    re.compile(r"^પ્ર\.\s*[૦-૯]+$"),      # corner chapter marker, e.g. "પ્ર. ૨"
-    re.compile(r"^[૦-૯0-9]+$"),           # plain page number
+    re.compile(r"^(?:પ્ર|प्र)\.\s*[૦-૯०-९]+$"),  # corner chapter marker, e.g. "પ્ર. ૨"
+    re.compile(r"^[૦-૯०-९0-9]+$"),                # plain page number
 ]
-PRAKARAN_RE = re.compile(r"પ્રકરણ\s*[:：]\s*([૦-૯0-9]+)")
+# Also accept the Devanagari spelling "प्रकरण" for the same reason as the
+# digit widening above -- the marker word itself can come back mis-scripted.
+PRAKARAN_RE = re.compile(r"(?:પ્રકરણ|प्रकरण)\s*[:：]\s*([૦-૯०-९0-9]+)")
 METER_LABEL_RE = re.compile(r"^([^\s:：]{1,15})\s*[:：]\s*$")
 
 
@@ -51,9 +61,9 @@ def strip_tags(html_str: str) -> str:
     return ex.text()
 
 
-def to_int(guj_num: str):
+def to_int(num_str: str):
     try:
-        return int(guj_num.translate(GUJ_DIGITS))
+        return int(num_str.translate(DIGIT_TRANSLATE))
     except ValueError:
         return None
 
@@ -99,10 +109,31 @@ def main():
 
     current_prakaran = None
     current_meter = None
-    verse_buffer = []       # accumulated lines for the verse in progress
+    verse_buffer = []            # accumulated lines for the verse in progress
+    verse_buffer_start_page = None
 
     def target_list():
         return front_matter if current_prakaran is None else prakaran_items.setdefault(current_prakaran, [])
+
+    def flush_verse_buffer_as_unparsed(reason):
+        """Dump whatever's stuck in verse_buffer as a flagged entry instead of
+        letting it silently carry across a prakaran boundary or get dropped.
+        A verse only ends up here when its trailing marker never parsed as a
+        number (e.g. a misread digit) -- content, not shape, is the problem."""
+        nonlocal verse_buffer, verse_buffer_start_page
+        if verse_buffer:
+            target_list().append({
+                "prakaran": current_prakaran,
+                "type": "unparsed",
+                "lines": verse_buffer,
+                "source_page": verse_buffer_start_page,
+                "note": reason,
+            })
+            print(f"WARNING: page {verse_buffer_start_page}: flushed "
+                  f"{len(verse_buffer)} unparsed line(s) into prakaran "
+                  f"{current_prakaran} ({reason})", flush=True)
+            verse_buffer = []
+            verse_buffer_start_page = None
 
     for page_path in pages:
         data = json.loads(page_path.read_text(encoding="utf-8"))
@@ -117,8 +148,10 @@ def main():
                 for line, marker in parse_table_rows(html_str):
                     if not line:
                         continue
+                    if not verse_buffer:
+                        verse_buffer_start_page = page_num
                     verse_buffer.append(line)
-                    num = to_int(re.sub(r"[^૦-૯0-9]", "", marker))
+                    num = to_int(NON_DIGIT_RE.sub("", marker))
                     if num is not None:
                         target_list().append({
                             "prakaran": current_prakaran,
@@ -128,6 +161,7 @@ def main():
                             "source_page": page_num,
                         })
                         verse_buffer = []
+                        verse_buffer_start_page = None
                 # leftover unflushed lines (no trailing number) carry over
                 # to the next table/page as-is
                 continue
@@ -138,7 +172,11 @@ def main():
 
             prakaran_match = PRAKARAN_RE.search(text)
             if prakaran_match:
-                current_prakaran = to_int(prakaran_match.group(1))
+                new_prakaran = to_int(prakaran_match.group(1))
+                flush_verse_buffer_as_unparsed(
+                    f"verse marker never recognized before prakaran changed "
+                    f"to {new_prakaran}")
+                current_prakaran = new_prakaran
                 current_meter = None
                 continue
 
@@ -155,19 +193,17 @@ def main():
                 "source_page": page_num,
             })
 
-    for num, items in sorted(prakaran_items.items()):
-        out_path = out_dir / f"prakaran-{num}.json"
-        out_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-
+    flush_verse_buffer_as_unparsed("verse marker never recognized before end of OCR cache")
     if front_matter:
         (out_dir / "front-matter.json").write_text(
             json.dumps(front_matter, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+    for num, items in sorted(prakaran_items.items()):
+        out_path = out_dir / f"prakaran-{num}.json"
+        out_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"Wrote {len(prakaran_items)} prakaran files, "
           f"{len(front_matter)} front-matter items.")
-    if verse_buffer:
-        print(f"WARNING: {len(verse_buffer)} unflushed verse line(s) at end of run: {verse_buffer}")
 
 
 if __name__ == "__main__":
