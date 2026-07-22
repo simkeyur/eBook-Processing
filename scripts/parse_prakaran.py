@@ -42,6 +42,45 @@ NOISE_PATTERNS = [
 PRAKARAN_RE = re.compile(r"(?:પ્રકરણ|प्रकरण)\s*[:：]\s*([૦-૯०-९0-9]+)")
 METER_LABEL_RE = re.compile(r"^([^\s:：]{1,15})\s*[:：]\s*$")
 
+# When a page's verses render as a <p> with <br/>-separated lines instead of
+# a <table> (an OCR layout inconsistency, not a content problem), the parser
+# used to dump the whole thing as one undifferentiated "note" blob. Every
+# doha/chopai couplet in this book is exactly 2 lines, and the book's fixed
+# structure is: verses 1-3 are always પૂર્વછાયો, verses 4-25 are always
+# ચોપાઈ, and whatever follows is prose (colophon) -- confirmed by the book's
+# author/editor, not inferred. So instead of trusting the (often garbled)
+# verse-end numeral OCR'd inline, split by position and assign meter by the
+# fixed rule below.
+BR_SPLIT_RE = re.compile(r"<br\s*/?>", re.I)
+# Digit class here also accepts stray Odia digits (e.g. "୩") -- a rare
+# cross-script OCR artifact seen even at Q8_0 quantization; harmless to
+# strip since we ignore the marker's value entirely regardless.
+TRAILING_MARKER_RE = re.compile(r"[॥|]+\s*[૦-૯०-९0-9୦-୯]*\s*[॥|]*\s*$")
+
+
+def split_br_lines(html_str: str):
+    """Split a <p>line<br/>line<br/>...</p> block into stripped text lines."""
+    inner = re.sub(r"^<p[^>]*>|</p>\s*$", "", html_str.strip(), flags=re.I).strip()
+    lines = []
+    for seg in BR_SPLIT_RE.split(inner):
+        t = (strip_tags(seg) if "<" in seg else seg).strip()
+        if t:
+            lines.append(t)
+    return lines
+
+
+def looks_like_verse_blob(lines) -> bool:
+    """Verse lines end in a danda/pipe verse-end mark; colophon prose mostly
+    doesn't (only its very last line does) -- use a majority threshold."""
+    if len(lines) < 2:
+        return False
+    ending = sum(1 for l in lines if TRAILING_MARKER_RE.search(l))
+    return ending / len(lines) >= 0.6
+
+
+def meter_for_position(verse_num: int) -> str:
+    return "પૂર્વછાયો" if verse_num <= 3 else "ચોપાઈ"
+
 
 class TextExtractor(HTMLParser):
     def __init__(self):
@@ -165,6 +204,25 @@ def main():
                 # leftover unflushed lines (no trailing number) carry over
                 # to the next table/page as-is
                 continue
+
+            if "<br" in html_str.lower():
+                br_lines = split_br_lines(html_str)
+                if looks_like_verse_blob(br_lines):
+                    clean = [TRAILING_MARKER_RE.sub("", l).strip() for l in br_lines]
+                    clean = [l for l in clean if l]
+                    for i in range(0, len(clean) - 1, 2):
+                        vnum = i // 2 + 1
+                        target_list().append({
+                            "prakaran": current_prakaran,
+                            "verse_number": vnum,
+                            "meter": meter_for_position(vnum),
+                            "lines": [clean[i], clean[i + 1]],
+                            "source_page": page_num,
+                        })
+                    if len(clean) % 2 == 1:
+                        print(f"WARNING: page {page_num}: odd leftover line "
+                              f"in paragraph-verse blob: {clean[-1]!r}", flush=True)
+                    continue
 
             text = strip_tags(html_str) if "<" in html_str else html_str.strip()
             if is_noise(text):
