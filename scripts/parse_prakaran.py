@@ -251,12 +251,20 @@ def main():
                 continue
 
             # other prose: chapter intro/colophon lines, captions, etc.
-            target_list().append({
-                "prakaran": current_prakaran,
-                "type": "note",
-                "text": text,
-                "source_page": page_num,
-            })
+            # Consecutive notes are one continuous sentence split across
+            # blocks/pages by the OCR layout -- merge them instead of
+            # showing fragments as separate notes.
+            lst = target_list()
+            clean_text = re.sub(r"\s+", " ", text).strip()
+            if lst and lst[-1].get("type") == "note":
+                lst[-1]["text"] = (lst[-1]["text"] + " " + clean_text).strip()
+            else:
+                lst.append({
+                    "prakaran": current_prakaran,
+                    "type": "note",
+                    "text": clean_text,
+                    "source_page": page_num,
+                })
 
     flush_verse_buffer_as_unparsed("odd leftover line at end of OCR cache")
     if front_matter:
