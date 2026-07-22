@@ -26,7 +26,6 @@ from html.parser import HTMLParser
 # verse_buffer anomaly handling below.
 DIGIT_CHARS = "૦૧૨૩૪૫૬૭૮૯०१२३४५६७८९"
 DIGIT_TRANSLATE = str.maketrans(DIGIT_CHARS, "0123456789" * 2)
-NON_DIGIT_RE = re.compile(r"[^૦-૯०-९0-9]")
 
 NOISE_EXACT = {
     "INDEX",
@@ -107,8 +106,12 @@ def to_int(num_str: str):
         return None
 
 
-def parse_table_rows(html_str: str):
-    """Yield (line_text, marker_text) for each <tr> in a table block."""
+def parse_table_lines(html_str: str):
+    """Yield each <tr>'s line text (first cell) from a table block. The
+    second (marker) cell is intentionally ignored -- its digit is an OCR'd
+    per-page reference number, not the chapter-global verse position, and a
+    chapter always spans exactly 2 pages with numbering that must keep
+    counting across that break rather than trust whatever was printed."""
     row_re = re.compile(r"<tr>(.*?)</tr>", re.S)
     cell_re = re.compile(r"<td>(.*?)</td>", re.S)
     for row_match in row_re.finditer(html_str):
@@ -116,8 +119,8 @@ def parse_table_rows(html_str: str):
         if not cells:
             continue
         line = strip_tags(cells[0])
-        marker = strip_tags(cells[1]) if len(cells) > 1 else ""
-        yield line, marker
+        if line:
+            yield line
 
 
 def is_noise(text: str) -> bool:
@@ -147,18 +150,33 @@ def main():
     front_matter = []       # content before the first પ્રકરણ marker
 
     current_prakaran = None
-    current_meter = None
     verse_buffer = []            # accumulated lines for the verse in progress
     verse_buffer_start_page = None
+    verse_pos = 0                 # running verse position for the CURRENT
+                                   # chapter -- a chapter is always 2 pages,
+                                   # and verses keep counting across that
+                                   # page break rather than trust whatever
+                                   # per-page number was printed/OCR'd
 
     def target_list():
         return front_matter if current_prakaran is None else prakaran_items.setdefault(current_prakaran, [])
 
+    def emit_verse(line1, line2, page_num):
+        nonlocal verse_pos
+        verse_pos += 1
+        target_list().append({
+            "prakaran": current_prakaran,
+            "verse_number": verse_pos,
+            "meter": meter_for_position(verse_pos),
+            "lines": [line1, line2],
+            "source_page": page_num,
+        })
+
     def flush_verse_buffer_as_unparsed(reason):
         """Dump whatever's stuck in verse_buffer as a flagged entry instead of
         letting it silently carry across a prakaran boundary or get dropped.
-        A verse only ends up here when its trailing marker never parsed as a
-        number (e.g. a misread digit) -- content, not shape, is the problem."""
+        This only happens when a chapter has an odd number of accumulated
+        lines at a boundary -- content, not shape, is the problem."""
         nonlocal verse_buffer, verse_buffer_start_page
         if verse_buffer:
             target_list().append({
@@ -184,25 +202,15 @@ def main():
             is_table = "<table" in html_str
 
             if is_table:
-                for line, marker in parse_table_rows(html_str):
-                    if not line:
-                        continue
+                for line in parse_table_lines(html_str):
                     if not verse_buffer:
                         verse_buffer_start_page = page_num
                     verse_buffer.append(line)
-                    num = to_int(NON_DIGIT_RE.sub("", marker))
-                    if num is not None:
-                        target_list().append({
-                            "prakaran": current_prakaran,
-                            "verse_number": num,
-                            "meter": current_meter,
-                            "lines": verse_buffer,
-                            "source_page": page_num,
-                        })
+                    if len(verse_buffer) == 2:
+                        emit_verse(verse_buffer[0], verse_buffer[1], verse_buffer_start_page)
                         verse_buffer = []
                         verse_buffer_start_page = None
-                # leftover unflushed lines (no trailing number) carry over
-                # to the next table/page as-is
+                # an odd leftover line carries over to the next table/page as-is
                 continue
 
             if "<br" in html_str.lower():
@@ -211,14 +219,7 @@ def main():
                     clean = [TRAILING_MARKER_RE.sub("", l).strip() for l in br_lines]
                     clean = [l for l in clean if l]
                     for i in range(0, len(clean) - 1, 2):
-                        vnum = i // 2 + 1
-                        target_list().append({
-                            "prakaran": current_prakaran,
-                            "verse_number": vnum,
-                            "meter": meter_for_position(vnum),
-                            "lines": [clean[i], clean[i + 1]],
-                            "source_page": page_num,
-                        })
+                        emit_verse(clean[i], clean[i + 1], page_num)
                     if len(clean) % 2 == 1:
                         print(f"WARNING: page {page_num}: odd leftover line "
                               f"in paragraph-verse blob: {clean[-1]!r}", flush=True)
@@ -231,16 +232,22 @@ def main():
             prakaran_match = PRAKARAN_RE.search(text)
             if prakaran_match:
                 new_prakaran = to_int(prakaran_match.group(1))
-                flush_verse_buffer_as_unparsed(
-                    f"verse marker never recognized before prakaran changed "
-                    f"to {new_prakaran}")
-                current_prakaran = new_prakaran
-                current_meter = None
+                # A repeated marker for the SAME chapter (e.g. a running
+                # header) must not reset the position counter -- only an
+                # actual chapter change should.
+                if new_prakaran != current_prakaran:
+                    flush_verse_buffer_as_unparsed(
+                        f"odd leftover line before prakaran changed to {new_prakaran}")
+                    current_prakaran = new_prakaran
+                    verse_pos = 0
                 continue
 
             meter_match = METER_LABEL_RE.match(text)
             if meter_match:
-                current_meter = meter_match.group(1)
+                # Meter section labels (પૂર્વછાયો:/ચોપાઈ: etc.) are noise now --
+                # meter is assigned purely by position (see meter_for_position) --
+                # but still need to be matched here so they don't fall through
+                # to become spurious "note" entries below.
                 continue
 
             # other prose: chapter intro/colophon lines, captions, etc.
@@ -251,7 +258,7 @@ def main():
                 "source_page": page_num,
             })
 
-    flush_verse_buffer_as_unparsed("verse marker never recognized before end of OCR cache")
+    flush_verse_buffer_as_unparsed("odd leftover line at end of OCR cache")
     if front_matter:
         (out_dir / "front-matter.json").write_text(
             json.dumps(front_matter, ensure_ascii=False, indent=2), encoding="utf-8"
